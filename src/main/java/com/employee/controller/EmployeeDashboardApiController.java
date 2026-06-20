@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.time.LocalDate;
 import java.time.LocalTime;
 import java.time.temporal.ChronoUnit;
@@ -46,6 +47,7 @@ public class EmployeeDashboardApiController {
                 today
         ));
         data.put("leaveBalance", leaveBalance(employeeCode));
+        data.put("payroll", latestPayslip(employeeCode));
         data.put("pendingLeaveDays", scalarInt(
                 "select coalesce(sum(number_of_days), 0) from leave_requests where employee_code = ? and status = 'Pending'",
                 employeeCode
@@ -217,10 +219,26 @@ public class EmployeeDashboardApiController {
         Map<String, Object> data = new LinkedHashMap<>();
 
         data.put("profile", profile(employeeCode));
-        data.put("documents", list(
-                "select * from employee_documents where employee_code = ? order by uploaded_at desc",
+        List<Map<String, Object>> documents = list(
+                "SELECT id, document_name, document_type, uploaded_at " +
+                "FROM employee_documents " +
+                "WHERE employee_code = ? " +
+                "ORDER BY uploaded_at DESC",
                 employeeCode
-        ));
+        );
+
+        documents.forEach(doc -> {
+            doc.put(
+                    "downloadUrl",
+                    "/api/employees/" +
+                    employeeCode +
+                    "/documents/" +
+                    doc.get("id") +
+                    "/download"
+            );
+        });
+
+        data.put("documents", documents);
         data.put("preferences", preferences(employeeCode));
 
         return data;
@@ -270,28 +288,118 @@ public class EmployeeDashboardApiController {
 
         String contentType = photo.getContentType();
 
-        if (contentType == null || !contentType.startsWith("image/")) {
+        if (contentType == null ||
+                !contentType.startsWith("image/")) {
+
             return ResponseEntity.badRequest()
                     .body("Only image files are allowed.");
         }
 
-        String extension = extension(photo.getOriginalFilename());
-        String safeEmployeeCode = employeeCode.replaceAll("[^A-Za-z0-9_-]", "_");
-        String fileName = safeEmployeeCode + "-" + System.currentTimeMillis() + extension;
-        Path uploadDirectory = Paths.get("uploads", "profile-photos");
-
-        Files.createDirectories(uploadDirectory);
-        Files.copy(photo.getInputStream(), uploadDirectory.resolve(fileName));
-
-        String photoUrl = "/uploads/profile-photos/" + fileName;
+        byte[] imageBytes = photo.getBytes();
 
         jdbcTemplate.update(
-                "update employee_profiles set photo_url = ? where employee_code = ?",
-                photoUrl,
+                "INSERT INTO employee_profile_photos " +
+                "(employee_code, photo_name, content_type, photo_data, is_active) " +
+                "VALUES (?, ?, ?, ?, false)",
+                employeeCode,
+                photo.getOriginalFilename(),
+                contentType,
+                imageBytes
+        );
+
+        return ResponseEntity.ok("Profile photo uploaded.");
+    }
+
+    @PostMapping("/documents")
+    public ResponseEntity<?> uploadDocument(
+            @PathVariable String employeeCode,
+            @RequestParam("file") MultipartFile file,
+            @RequestParam(value = "documentType", defaultValue = "General") String documentType
+    ) throws IOException {
+
+        if (file.isEmpty()) {
+            return ResponseEntity.badRequest()
+                    .body("Please select a document.");
+        }
+
+        String extension = documentExtension(file.getOriginalFilename());
+
+        if (extension == null) {
+            return ResponseEntity.badRequest()
+                    .body("Only PDF, DOC, DOCX, JPG, JPEG, and PNG files are allowed.");
+        }
+
+        String originalName = safeDisplayName(
+                file.getOriginalFilename(),
+                "Document" + extension
+        );
+
+        byte[] fileBytes = file.getBytes();
+
+        jdbcTemplate.update(
+                "INSERT INTO employee_documents " +
+                "(employee_code, document_name, document_type, content_type, file_data) " +
+                "VALUES (?, ?, ?, ?, ?)",
+                employeeCode,
+                originalName,
+                emptyToNull(documentType),
+                file.getContentType(),
+                fileBytes
+        );
+
+        return ResponseEntity.ok(profilePage(employeeCode));
+    }
+    @GetMapping("/documents/{documentId}/download")
+    public ResponseEntity<byte[]> downloadDocument(
+            @PathVariable String employeeCode,
+            @PathVariable Long documentId
+    ) {
+
+        Map<String, Object> document = one(
+                "SELECT * FROM employee_documents " +
+                "WHERE id = ? AND employee_code = ?",
+                documentId,
                 employeeCode
         );
 
-        return ResponseEntity.ok(Map.of("photoUrl", photoUrl));
+        if (document == null) {
+            return ResponseEntity.notFound().build();
+        }
+
+        byte[] fileData = (byte[]) document.get("file_data");
+
+        String fileName =
+                String.valueOf(document.get("document_name"));
+
+        String contentType =
+                String.valueOf(document.get("content_type"));
+
+        return ResponseEntity.ok()
+                .header(
+                        "Content-Disposition",
+                        "attachment; filename=\"" + fileName + "\""
+                )
+                .header(
+                        "Content-Type",
+                        contentType
+                )
+                .body(fileData);
+    }
+
+    @DeleteMapping("/documents/{documentId}")
+    public ResponseEntity<?> deleteDocument(
+            @PathVariable String employeeCode,
+            @PathVariable Long documentId
+    ) {
+
+        jdbcTemplate.update(
+                "DELETE FROM employee_documents " +
+                "WHERE id = ? AND employee_code = ?",
+                documentId,
+                employeeCode
+        );
+
+        return ResponseEntity.ok(profilePage(employeeCode));
     }
 
     @PutMapping("/preferences")
@@ -345,13 +453,15 @@ public class EmployeeDashboardApiController {
     ) {
         try {
             List<Map<String, Object>> rows = list(
-                    "select id, employee_code, pay_period, payment_date, " +
-                    "basic_salary, hra, special_allowance, gross_salary, " +
-                    "pf_amount, professional_tax, tds, total_deductions, " +
-                    "net_salary, status, file_path, created_at " +
+                    "select id, employee_code, payroll_month as pay_period, generated_at as payment_date, " +
+                    "basic_salary, hra, allowances as special_allowance, " +
+                    "(basic_salary + hra + allowances) as gross_salary, " +
+                    "pf_deduction as pf_amount, tax_deduction as tds, other_deductions, " +
+                    "(pf_deduction + tax_deduction + other_deductions) as total_deductions, " +
+                    "net_salary, status, generated_at as created_at " +
                     "from payslips " +
                     "where employee_code = ? " +
-                    "order by payment_date desc",
+                    "order by payroll_month desc",
                     employeeCode
             );
             return ResponseEntity.ok(rows);
@@ -397,6 +507,23 @@ public class EmployeeDashboardApiController {
                 "select * from notification_preferences where employee_code = ?",
                 employeeCode
         );
+    }
+
+    private Map<String, Object> latestPayslip(String employeeCode) {
+        try {
+            return one(
+                    "select id, employee_code, payroll_month as pay_period, generated_at as payment_date, " +
+                    "basic_salary, hra, allowances as special_allowance, " +
+                    "(basic_salary + hra + allowances) as gross_salary, " +
+                    "pf_deduction as pf_amount, tax_deduction as tds, other_deductions, " +
+                    "(pf_deduction + tax_deduction + other_deductions) as total_deductions, " +
+                    "net_salary, status, generated_at as created_at " +
+                    "from payslips where employee_code = ? order by payroll_month desc limit 1",
+                    employeeCode
+            );
+        } catch (Exception ex) {
+            return null;
+        }
     }
 
     private int currentStreak(String employeeCode) {
@@ -479,5 +606,35 @@ public class EmployeeDashboardApiController {
         }
 
         return ".jpg";
+    }
+
+    private String documentExtension(String fileName) {
+
+        if (fileName == null || !fileName.contains(".")) {
+            return null;
+        }
+
+        String extension = fileName.substring(fileName.lastIndexOf(".")).toLowerCase();
+
+        if (extension.matches("\\.(pdf|doc|docx|jpg|jpeg|png)")) {
+            return extension;
+        }
+
+        return null;
+    }
+
+    private String safeDisplayName(String fileName, String fallback) {
+
+        if (fileName == null || fileName.isBlank()) {
+            return fallback;
+        }
+
+        String cleaned = Paths.get(fileName).getFileName().toString()
+                .replaceAll("[\\r\\n]", "")
+                .trim();
+
+        return cleaned.isBlank()
+                ? fallback
+                : cleaned;
     }
 }
